@@ -1,10 +1,10 @@
 # 众包任务推荐强化学习环境
 
-环境用途：把 `data_processed_all/data_processed` 里的预处理数据包装成 DQN 可以交互的形式。
+环境用途：把 `data_processed` 里的预处理数据包装成 DQN 可以交互的形式。
 
 ## 文件说明
 
-- `crowd_env.py`：核心环境代码，包含 `CrowdRecEnv`、`load_split()`、`load_all_splits()`。
+- `crowd_env.py`：核心环境代码，包含 `CrowdRecEnv`、`load_split()`、`load_all_splits()`、`load_worker_episodes()`。
 - `demo_random.py`：随机合法动作的 smoke test，用来确认环境可以跑通。
 - `__init__.py`：方便从 `env` 包导入。
 
@@ -70,22 +70,25 @@ project_duration_days
 category_match
 industry_match
 project_popularity
+worker_category_count
+remaining_days
 ```
 
 因此默认：
 
 ```text
-state["features"].shape = [21, 11]
-action_dim = 21
+state["features"].shape = [20, 13]
+action_dim = 20
 ```
 
 如果某条样本只有 5 个候选任务，那么前 5 行是有效候选，其余行全 0，`action_mask` 后 16 位为 0。
 
-如果候选任务带有动态剩余名额字段 `remaining_slots`，环境会同时用它过滤动作：
+如果候选任务带有动态剩余时间字段 `remaining_days`，环境会同时用它过滤动作：
 
 ```text
-remaining_slots <= 0 时，对应 action_mask 位置为 0
-remaining_slots 缺失时，默认该候选任务仍可推荐
+remaining_days <= 0 时，对应 action_mask 位置为 0
+remaining_days 缺失时，如果有 deadline，则用 deadline 和 timestamp 判断
+remaining_days 和 deadline 都缺失时，默认该候选任务仍可推荐
 ```
 
 ## Action 定义
@@ -100,7 +103,7 @@ action ∈ [0, num_candidates - 1]
 
 如果模型选到 padding 位置，环境会返回 `invalid_action_penalty`，默认是 `-1.0`。
 
-如果模型选到 `remaining_slots <= 0` 的已满任务，也会被视为非法 action，并返回同样的惩罚。
+如果模型选到已过截止时间过滤条件的任务，也会被视为非法 action，并返回同样的惩罚。
 
 ## Reward 定义
 
@@ -173,13 +176,13 @@ env = CrowdRecEnv(
 worker_quality + 0.5 * urgency
 ```
 
-如果候选任务数据里有 `deadline`，环境会用 `sample["timestamp"]` 到 deadline 的剩余天数动态计算紧迫度：
+如果候选任务数据里有 `remaining_days`，环境会优先使用它计算紧迫度。A 同学新版预处理脚本保留的是原始剩余天数，因此 `remaining_days > 0` 可以直接表示任务仍在 deadline 前：
 
 ```text
 urgency = 1 / (1 + exp(remaining_days))
 ```
 
-如果当前数据还没有 `deadline`，环境会回退使用 `project_duration_days`，保证旧数据仍能运行。这个奖励类型只是在环境里可用；如果要通过训练脚本命令行直接使用，还需要模型训练脚本把 `requester_urgency` 加进自己的 `--reward-type` 参数。
+如果旧数据没有 `remaining_days`，但有 `deadline`，环境会用 `sample["timestamp"]` 到 deadline 的剩余天数动态计算；如果两者都没有，则回退使用 `project_duration_days`，保证旧数据仍能运行。这个奖励类型只是在环境里可用；如果要通过训练脚本命令行直接使用，还需要模型训练脚本把 `requester_urgency` 加进自己的 `--reward-type` 参数。
 
 ### 混合目标
 

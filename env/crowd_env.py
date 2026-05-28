@@ -17,7 +17,6 @@ import numpy as np
 
 DEFAULT_DATA_DIR = os.path.join(
     os.path.dirname(os.path.dirname(__file__)),
-    "data_processed_all",
     "data_processed",
 )
 
@@ -34,6 +33,8 @@ DEFAULT_FEATURE_ORDER = [
     "category_match",
     "industry_match",
     "project_popularity",
+    "worker_category_count",
+    "remaining_days",
 ]
 
 SPLIT_FILES = {
@@ -41,6 +42,7 @@ SPLIT_FILES = {
     "val": "enhanced_val.pkl",
     "test": "enhanced_test.pkl",
 }
+WORKER_EPISODES_FILE = "worker_episodes.pkl"
 
 
 @dataclass(frozen=True)
@@ -81,6 +83,14 @@ def load_all_splits(data_dir: str = DEFAULT_DATA_DIR) -> Dict[str, List[Dict[str
     """一次性读取 train/val/test 三个划分。"""
 
     return {split: load_split(split, data_dir) for split in SPLIT_FILES}
+
+
+def load_worker_episodes(data_dir: str = DEFAULT_DATA_DIR) -> Dict[int, List[Dict[str, Any]]]:
+    """读取按 worker_id 分组的 episode 数据。"""
+
+    path = os.path.join(data_dir, WORKER_EPISODES_FILE)
+    with open(path, "rb") as f:
+        return pickle.load(f)
 
 
 class CrowdRecEnv:
@@ -166,7 +176,7 @@ class CrowdRecEnv:
         sample = self.data[self.index]
         state = self._build_state(sample)
         action_int = int(action)
-        # action 必须落在 action_mask 允许的位置，不能选 padding 或已满任务。
+        # action 必须落在 action_mask 允许的位置，不能选 padding 或过期任务。
         valid_action = (
             0 <= action_int < self.max_candidates
             and state["action_mask"][action_int] > 0
@@ -216,7 +226,7 @@ class CrowdRecEnv:
         n = len(vectors)
         features[:n, :] = np.asarray(vectors, dtype=np.float32)
         for i in range(n):
-            if self._candidate_has_remaining_slot(sample, i):
+            if self._candidate_before_deadline(sample, i):
                 action_mask[i] = 1.0
 
         return {
@@ -279,10 +289,15 @@ class CrowdRecEnv:
         )
 
     def _compute_urgency(self, sample: Mapping[str, Any], action: int) -> float:
-        """根据 deadline 动态计算紧迫度，缺失时回退到 project_duration_days。"""
+        """根据 remaining_days 或 deadline 计算紧迫度。"""
 
         feat = sample["candidate_features"][action]
         project = sample["candidate_projects"][action]
+
+        if "remaining_days" in feat:
+            remaining_days = float(feat["remaining_days"])
+            return float(1.0 / (1.0 + np.exp(remaining_days)))
+
         deadline = self._lookup_candidate_value(project, feat, "deadline")
 
         remaining_days = None
@@ -298,15 +313,24 @@ class CrowdRecEnv:
         remaining_days = max(float(remaining_days), 0.0)
         return float(1.0 / (1.0 + np.exp(remaining_days)))
 
-    def _candidate_has_remaining_slot(self, sample: Mapping[str, Any], index: int) -> bool:
-        """检查候选任务是否还有名额；字段缺失时保持旧行为，默认可选。"""
+    def _candidate_before_deadline(self, sample: Mapping[str, Any], index: int) -> bool:
+        """检查候选任务是否还在截止时间前；字段缺失时默认可选。"""
 
         project = sample["candidate_projects"][index]
         feat = sample["candidate_features"][index]
-        remaining_slots = self._lookup_candidate_value(project, feat, "remaining_slots")
-        if remaining_slots is None:
+        remaining_days = feat.get("remaining_days")
+        if remaining_days is not None:
+            return float(remaining_days) > 0
+
+        deadline = self._lookup_candidate_value(project, feat, "deadline")
+        if deadline is None:
             return True
-        return float(remaining_slots) > 0
+
+        deadline_dt = self._parse_datetime(deadline)
+        timestamp_dt = self._parse_datetime(sample.get("timestamp"))
+        if deadline_dt is None or timestamp_dt is None:
+            return True
+        return deadline_dt > timestamp_dt
 
     @staticmethod
     def _lookup_candidate_value(project: Any, feat: Mapping[str, Any], name: str) -> Any:

@@ -1,0 +1,30 @@
+{
+  "worker_quality": {
+    "mean": 0.8473539162010403,
+    "std": 0.13666755997986613
+  },
+  "worker_history_count": {
+    "mean": 4.618955959826941,
+    "std": 1.539336516407896
+  },
+  "worker_active_days": {
+    "mean": 5.736340093012303,
+    "std": 0.7770000190492443
+  },
+  "project_entry_count": {
+    "mean": 4.232855505462129,
+    "std": 0.8125901648321817
+  },
+  "project_duration_days": {
+    "mean": 2.869939756787267,
+    "std": 1.1418376142948332
+  },
+  "project_popularity": {
+    "mean": 8.2706934383551,
+    "std": 9.79644943974178
+  },
+  "worker_category_count": {
+    "mean": 3.8585917818307958,
+    "std": 2.1975235381919678
+  }
+}

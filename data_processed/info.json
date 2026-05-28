@@ -1,0 +1,24 @@
+{
+  "train_size": 134475,
+  "val_size": 28816,
+  "test_size": 28817,
+  "num_workers": 1796,
+  "max_candidates": 20,
+  "history_len": 10,
+  "feature_order": [
+    "worker_quality",
+    "worker_history_count",
+    "worker_active_days",
+    "project_category",
+    "project_sub_category",
+    "project_industry",
+    "project_entry_count",
+    "project_duration_days",
+    "category_match",
+    "industry_match",
+    "project_popularity",
+    "worker_category_count",
+    "remaining_days"
+  ],
+  "feature_dim": 13
+}
