@@ -14,7 +14,7 @@
   供 episode 级别的 RL 训练使用。
 """
 
-from __future__ import annotations
+#from __future__ import annotations
 
 import glob
 import json
@@ -363,9 +363,30 @@ def build_events(
             candidates.append(pid_pos)
 
         # 采样负样本
+        # 新增修改
+        # 采样负样本（加权采样：deadline 临近 + category/industry 匹配优先）
         negatives = [p for p in candidates if p != pid_pos]
-        np.random.shuffle(negatives)
-        negatives = negatives[: MAX_CANDIDATES - 1]
+
+        if len(negatives) > MAX_CANDIDATES - 1:
+            def score_candidate(p):
+                info = project_info[p]
+                # 紧迫度得分：remaining_days 越小分越高，+1 防止除零
+                remaining = max((info["deadline"] - t).days, 0)
+                urgency_score = 1.0 / (remaining + 1)
+                # 相关性得分：category 匹配 +1，industry 匹配 +0.5
+                relevance_score = (
+                    1.0 * int(info["category"] == ws["favorite_category"])
+                    + 0.5 * int(info["industry"] == ws["favorite_industry"])
+                )
+                # 加权总分 + 小随机扰动（避免分数完全相同时顺序固定）
+                return urgency_score + relevance_score + np.random.uniform(0, 0.1)
+
+            scores = np.array([score_candidate(p) for p in negatives])
+            # 归一化为概率分布
+            probs = scores / scores.sum()
+            chosen_idx = np.random.choice(len(negatives), size=MAX_CANDIDATES - 1, replace=False, p=probs)
+            negatives = [negatives[i] for i in chosen_idx]
+
         final_candidates = negatives + [pid_pos]
         np.random.shuffle(final_candidates)
         positive_index = final_candidates.index(pid_pos)
