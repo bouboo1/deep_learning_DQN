@@ -1,8 +1,8 @@
 """运行 DQN / Double DQN / Dueling DQN 三种变体的对比实验，生成汇总图。
 
 用法：
-    python 强化学习/run_all_variants.py --epochs 5
-    python 强化学习/run_all_variants.py --epochs 3 --train-limit 10000 --val-limit 3000
+    python requester_model/run_all_variants.py --epochs 5
+    python requester_model/run_all_variants.py --epochs 3 --train-limit 10000 --val-limit 3000
 """
 
 from __future__ import annotations
@@ -67,6 +67,8 @@ def run_variant(variant: str, args: argparse.Namespace, out_dir: Path) -> dict:
         cmd += ["--max-steps-per-epoch", str(args.max_steps_per_epoch)]
     if args.max_eval_steps:
         cmd += ["--max-eval-steps", str(args.max_eval_steps)]
+    if args.log_interval > 0:
+        cmd += ["--log-interval", str(args.log_interval)]
 
     print(f"\n{'='*60}")
     print(f"运行变体: {VARIANT_LABELS[variant]}")
@@ -148,7 +150,8 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--variants", nargs="+", choices=VARIANTS, default=VARIANTS,
                         help="要运行的变体列表")
-    parser.add_argument("--output-dir", default="强化学习/runs_all_variants")
+    parser.add_argument("--output-dir", default="requester_model/runs_all_variants")
+    parser.add_argument("--log-interval", type=int, default=0, help="每隔多少步打印一次步级指标（0=不打印）")
     args = parser.parse_args()
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
