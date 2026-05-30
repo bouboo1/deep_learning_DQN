@@ -1,669 +1,208 @@
-# 众包任务推荐强化学习环境
+# env/crowd_env.py 设计说明
 
-环境用途：把预处理数据包装成 DQN 可以交互的形式。支持两种视角：
+这个文件是整个项目的核心，把预处理好的数据包装成 DQN 可以交互的环境。支持两个视角：Worker 视角和 Requester 视角。
 
-- **Worker 视角**（`CrowdRecEnv`）：数据来自 `data_processed/`，每条样本 = 一个 worker 到达平台，从候选 project 里推荐一个。
-- **Requester 视角**（`RequesterCrowdEnv`）：数据来自 `data_processed_requester/`，每条样本 = 一个 project 收到新 entry，从候选 worker 池里推荐最合适的 worker。
+---
 
-## 文件说明
+## 整体思路
 
-- `crowd_env.py`：核心环境代码，包含 `CrowdRecEnv`、`RequesterCrowdEnv`、`load_split()`、`load_all_splits()`、`load_worker_episodes()`、`load_requester_split()`、`load_project_episodes()`。
-- `demo_random.py`：随机合法动作的 smoke test，用来确认环境可以跑通。
-- `__init__.py`：方便从 `env` 包导入。
+众包推荐本质上是一个序列决策问题：每次有 worker 到达或 project 收到新 entry，系统就要做一次推荐决策。我们把每一次决策当作一个时间步，按时间顺序串起来，形成一个"伪在线"的强化学习环境。
 
-## 环境定义
+数据是历史日志，所以环境是离线的——动作不会真正改变后续候选集，但按时间排序保证了特征的时序合理性，不会用到未来信息。
 
-### Worker 视角（CrowdRecEnv）
+---
 
-每条样本表示一次 worker 到达平台后的推荐决策：
+## 两个视角的对比
 
-- `state`：候选 project 的特征矩阵。
-- `action`：推荐第几个候选 project。
-- `reward`：根据推荐结果计算奖励。
-- `next_state`：时间顺序上的下一条 worker 到达样本。
-- `done`：是否跑完整个 split。
+| | Worker 视角 | Requester 视角 |
+|---|---|---|
+| 每步含义 | 一个 worker 到达，推荐一个 project | 一个 project 收到 entry，推荐一个 worker |
+| 候选集 | 候选 project（最多 20 个） | 候选 worker（最多 20 个） |
+| 特征维度 | 13 维 | 16 维 |
+| 奖励目标 | 推荐命中 worker 真实选择 | 推荐高质量、多样、及时的 worker |
+| 数据文件 | `enhanced_train/val/test.pkl` | `requester_train/val/test.pkl` |
+| 数据目录 | `data_processed/` | `data_processed/`（同一目录） |
 
-```python
-from env import CrowdRecEnv, load_split
+---
 
-train_data = load_split("train")
-env = CrowdRecEnv(train_data, reward_type="worker")
+## Worker 视角（CrowdRecEnv）
 
-state = env.reset()
-done = False
+### 状态设计
 
-while not done:
-    action = env.sample_random_action(state)
-    next_state, reward, done, info = env.step(action)
-    state = next_state
-```
-
-### Requester 视角（RequesterCrowdEnv）
-
-每条样本表示一个 project 收到新 entry 时的推荐决策：
-
-- `state`：候选 worker 的特征矩阵（project 上下文 + worker 侧特征）。
-- `action`：推荐第几个候选 worker。
-- `reward`：基于 worker 质量、多样性、任务紧迫度计算。
-- `next_state`：时间顺序上的下一条 project 收到 entry 的样本。
-- `done`：是否跑完整个 split。
-
-```python
-from env import RequesterCrowdEnv, load_requester_split
-
-train_data = load_requester_split("train")
-env = RequesterCrowdEnv(train_data)
-
-state = env.reset()
-done = False
-
-while not done:
-    action = env.sample_random_action(state)
-    next_state, reward, done, info = env.step(action)
-    state = next_state
-```
-
-## State 格式
-
-### Worker 视角
-
-`reset()` 和 `step()` 返回的 state 是一个字典：
+每个时间步的状态是一个字典：
 
 ```python
 {
-    "features": np.ndarray,      # shape = [max_candidates, feature_dim]
-    "action_mask": np.ndarray,   # shape = [max_candidates]
-    "worker_id": np.ndarray,
-    "timestamp_index": np.ndarray
+    "features":        # shape [20, 13]，候选 project 特征矩阵，不足 20 个用 0 padding
+    "action_mask":     # shape [20]，1 表示可选，0 表示 padding 或已过期
+    "worker_id":       # 当前 worker 的 ID
+    "timestamp_index": # 当前样本在数据集中的位置
 }
 ```
 
-当前数据中候选任务数不是完全固定的，所以环境会 padding 到 `max_candidates`。默认 `max_candidates` 会自动取当前 split 里的最大候选数，目前一般是 21。
+特征矩阵的每一行对应一个候选 project，13 个特征如下：
 
-模型选动作时必须使用 `action_mask` 屏蔽非法 action：
+| 特征 | 含义 | 备注 |
+|------|------|------|
+| worker_quality | worker 质量评分 | z-score 归一化 |
+| worker_history_count | worker 历史完成任务数 | log1p + z-score |
+| worker_active_days | worker 活跃天数 | z-score |
+| project_category | 项目类别 ID | 整数编码 |
+| project_sub_category | 项目子类别 ID | 整数编码 |
+| project_industry | 项目行业 ID | 整数编码 |
+| project_entry_count | 项目历史参与人数 | z-score |
+| project_duration_days | 项目持续天数 | z-score |
+| category_match | worker 偏好类别与项目是否一致 | 0/1 |
+| industry_match | worker 偏好行业与项目是否一致 | 0/1 |
+| project_popularity | 项目流行度 | z-score |
+| worker_category_count | worker 参与过的类别数 | z-score |
+| remaining_days | 项目剩余天数 | env 内用 sigmoid(v/30) 压到 (0,1) |
 
-```python
-valid = state["action_mask"] == 1
-```
+`remaining_days` 是唯一在 env 里做二次处理的特征，原因是它的原始值范围（0~200 天）和其他 z-score 特征量纲差距太大，用 sigmoid 压缩后量纲一致。
 
-特征顺序固定为（13 维）：
+### 动作设计
 
-```text
-worker_quality
-worker_history_count
-worker_active_days
-project_category
-project_sub_category
-project_industry
-project_entry_count
-project_duration_days
-category_match
-industry_match
-project_popularity
-worker_category_count
-remaining_days
-```
+从 0 到 19 选一个整数，表示推荐候选列表里第几个 project。选到 `action_mask=0` 的位置视为非法动作，给 -1 惩罚。
 
-因此默认：
+### 奖励设计
 
-```text
-state["features"].shape = [20, 13]
-action_dim = 20
-```
+命中正样本（推荐的 project 和 worker 历史真实选择一致）得 1，否则得 0。
 
-如果某条样本只有 5 个候选任务，那么前 5 行是有效候选，其余行全 0，`action_mask` 后 16 位为 0。
+这里的逻辑是：worker 历史上选了哪个 project，说明那个对他最有吸引力，推荐对了就是最大化了他的利益。
 
-如果候选任务带有动态剩余时间字段 `remaining_days`，环境会同时用它过滤动作：
+支持四种 `reward_type`：
 
-```text
-remaining_days <= 0 时，对应 action_mask 位置为 0
-remaining_days 缺失时，如果有 deadline，则用 deadline 和 timestamp 判断
-remaining_days 和 deadline 都缺失时，默认该候选任务仍可推荐
-```
+| reward_type | 计算方式 |
+|---|---|
+| `worker` | 命中得 1，否则 0 |
+| `requester` | 命中后按 project 流行度给分 |
+| `requester_urgency` | 命中后按流行度 + 紧迫度给分 |
+| `hybrid` | `alpha × worker奖励 + (1-alpha) × requester奖励` |
 
-### Requester 视角
+### 截止时间过滤
 
-`reset()` 和 `step()` 返回的 state 是一个字典：
+`_build_state` 里构建 `action_mask` 时，会检查每个候选 project 的 `remaining_days`，小于 0 的（已过期）直接置 0，模型不能选。这是处理动态性的关键——随着时间推进，过期任务自动从候选集里消失。
+
+---
+
+## Requester 视角（RequesterCrowdEnv）
+
+继承自 `CrowdRecEnv`，重写了状态构建、奖励计算和 info 构建三个方法。
+
+### 状态设计
+
+每个时间步的状态：
 
 ```python
 {
-    "features": np.ndarray,      # shape = [max_candidates, feature_dim]
-    "action_mask": np.ndarray,   # shape = [max_candidates]
-    "project_id": np.ndarray,
-    "timestamp_index": np.ndarray
+    "features":        # shape [20, 16]，候选 worker 特征矩阵
+    "action_mask":     # shape [20]，project_remaining_days >= 0 才可选
+    "project_id":      # 当前 project 的 ID
+    "timestamp_index": # 当前样本位置
 }
 ```
 
-特征顺序固定为（16 维，project 上下文 + worker 侧特征）：
+16 个特征分两组：
 
-```text
-project_category
-project_sub_category
-project_industry
-project_duration_days
-project_remaining_days
-project_current_entry_count
-project_hist_entry_count
-project_fill_rate
-worker_quality
-worker_history_count
-worker_active_days
-worker_category_match
-worker_industry_match
-worker_category_count
-worker_already_submitted
-worker_recent_activity
+**Project 上下文（描述当前任务的状态）**：
+
+| 特征 | 含义 |
+|------|------|
+| project_category | 项目类别 ID |
+| project_sub_category | 项目子类别 ID |
+| project_industry | 项目行业 ID |
+| project_duration_days | 项目总持续天数 |
+| project_remaining_days | 项目剩余天数 |
+| project_current_entry_count | 当前已收到的 entry 数（动态更新） |
+| project_hist_entry_count | 历史平均 entry 数（静态参考） |
+| project_fill_rate | 饱和度 = current / hist，反映任务完成进度 |
+
+**Worker 侧特征（描述每个候选 worker）**：
+
+| 特征 | 含义 |
+|------|------|
+| worker_quality | worker 质量评分 |
+| worker_history_count | 历史任务数 |
+| worker_active_days | 活跃天数 |
+| worker_category_match | 偏好类别与项目是否匹配 |
+| worker_industry_match | 偏好行业与项目是否匹配 |
+| worker_category_count | 参与过的类别数（专项能力） |
+| worker_already_submitted | 是否已提交过此项目（动态更新） |
+| worker_recent_activity | 最近 7 天活跃次数（动态更新） |
+
+其中 `project_current_entry_count`、`worker_already_submitted`、`worker_recent_activity` 三个特征是动态的，在预处理时按时间顺序计算，反映每个决策时刻的真实状态。
+
+### 动作设计
+
+从 0 到 19 选一个整数，表示推荐候选列表里第几个 worker。
+
+### 奖励设计
+
+```
+reward = quality_weight × (1 + urgency_weight × urgency) × worker_quality
+       + diversity_weight × (1 - worker_already_submitted)
 ```
 
-因此默认：
+三个部分：
 
-```text
-state["features"].shape = [20, 16]
-action_dim = 20
-```
+**质量项**：推荐的 worker 质量越高越好，这是主项，权重默认 1.0。
 
-`action_mask` 的过滤条件：`project_remaining_days < 0` 时对应位置为 0（任务已过 deadline）。
+**紧急度加成**：`urgency = 1 / (1 + exp(remaining_days))`，剩余天数越少，urgency 越接近 1，quality 的有效权重就越大。设计意图是：快到 deadline 的任务更需要高质量 worker，不能随便推。
 
-## Action 定义
+**多样性项**：如果推荐的 worker 之前没有提交过这个 project，额外加 0.3 分。避免系统总是推同一批高质量 worker，让更多 worker 有机会参与。
 
-### Worker 视角
+默认权重：`quality_weight=1.0`，`urgency_weight=0.5`，`diversity_weight=0.3`，可在初始化时调整。
 
-`action` 是候选 project 的下标：
+---
 
-```text
-action ∈ [0, num_candidates - 1]
-```
+## EnvSpec
 
-例如 `action = 3` 表示推荐当前样本的第 4 个候选 project。
-
-### Requester 视角
-
-`action` 是候选 worker 的下标：
-
-```text
-action ∈ [0, num_candidates - 1]
-```
-
-例如 `action = 2` 表示推荐当前样本的第 3 个候选 worker。
-
-如果模型选到 padding 位置，环境会返回 `invalid_action_penalty`，默认是 `-1.0`。
-
-如果模型选到已过截止时间过滤条件的任务，也会被视为非法 action，并返回同样的惩罚。
-
-## Reward 定义
-
-环境内置多种奖励，worker 和 requester 视角各自独立。
-
-### Worker 视角奖励（CrowdRecEnv）
-
-#### 参与者利益
+两个环境都有一个 `spec` 属性，给模型代码用：
 
 ```python
-env = CrowdRecEnv(train_data, reward_type=”worker”)
+env.spec.state_shape   # (max_candidates, feature_dim)，即 (20, 13) 或 (20, 16)
+env.spec.action_dim    # max_candidates，即 20
+env.spec.feature_order # 特征名列表，按顺序对应特征矩阵的列
 ```
 
-默认奖励：
+DQN 网络的输入层维度从 `env.spec.state_shape` 读取，不要硬编码。
 
-```text
-reward = 1, 如果 action == positive_index
-reward = 0, 否则
-```
+---
 
-含义：推荐命中 worker 历史中真实选择的任务，就认为满足参与者兴趣。
-
-#### 请求者利益（worker 视角数据）
+## 数据加载
 
 ```python
-env = CrowdRecEnv(train_data, reward_type=”requester”)
+from env import load_split, load_requester_split
+
+# Worker 视角
+train_data = load_split("train")          # data_processed/enhanced_train.pkl
+val_data   = load_split("val")
+test_data  = load_split("test")
+
+# Requester 视角
+req_train  = load_requester_split("train")  # data_processed/requester_train.pkl
+req_val    = load_requester_split("val")
+req_test   = load_requester_split("test")
 ```
 
-默认奖励：
+两个视角的数据都在 `data_processed/` 目录下，文件名不同。
 
-```text
-reward = worker_quality, 如果 action == positive_index
-reward = 0, 否则
-```
+---
 
-含义：请求者希望任务被真实选择，并且由质量更高的 worker 完成。
-
-注意：这里的 `worker_quality` 来自预处理后的标准化特征，可能出现负数。负数表示低于训练集均值，不是数据错误。
-
-可以加入项目流行度权重：
+## DQN 接入方式
 
 ```python
-env = CrowdRecEnv(
-    train_data,
-    reward_type=”requester”,
-    requester_quality_weight=1.0,
-    requester_popularity_weight=0.2,
-)
-```
-
-这时命中奖励为：
-
-```text
-worker_quality + 0.2 * project_popularity
-```
-
-#### 请求者紧迫度利益（worker 视角数据）
-
-```python
-env = CrowdRecEnv(
-    train_data,
-    reward_type=”requester_urgency”,
-    requester_quality_weight=1.0,
-    requester_urgency_weight=0.5,
-    requester_popularity_weight=0.0,
-)
-```
-
-默认命中奖励为：
-
-```text
-worker_quality + 0.5 * urgency
-```
-
-如果候选任务数据里有 `remaining_days`，环境会优先使用它计算紧迫度。A 同学新版预处理脚本保留的是原始剩余天数，因此 `remaining_days > 0` 可以直接表示任务仍在 deadline 前：
-
-```text
-urgency = 1 / (1 + exp(remaining_days))
-```
-
-如果旧数据没有 `remaining_days`，但有 `deadline`，环境会用 `sample[“timestamp”]` 到 deadline 的剩余天数动态计算；如果两者都没有，则回退使用 `project_duration_days`，保证旧数据仍能运行。这个奖励类型只是在环境里可用；如果要通过训练脚本命令行直接使用，还需要模型训练脚本把 `requester_urgency` 加进自己的 `--reward-type` 参数。
-
-#### 混合目标（worker 视角数据）
-
-```python
-env = CrowdRecEnv(train_data, reward_type=”hybrid”, hybrid_alpha=0.5)
-```
-
-奖励：
-
-```text
-0.5 * worker_reward + 0.5 * requester_reward
-```
-
-这个模式可以作为综合平台收益的补充实验。
-
-注意：step 级 `R_t` 日志属于训练循环输出，不在 `env` 目录内实现。环境每次 `step()` 已经返回 `reward` 和 `info[“reward”]`，训练脚本可以据此写入 step 级日志或 CSV。
-
-### Requester 视角奖励（RequesterCrowdEnv）
-
-`RequesterCrowdEnv` 使用专为 requester 视角数据设计的奖励，命中后综合三项：
-
-```text
-reward = quality_weight * worker_quality
-       + diversity_weight  (如果该 worker 尚未提交过该 project)
-       + urgency_weight * urgency
-```
-
-其中 `urgency = 1 / (1 + exp(project_remaining_days))`，remaining_days 越小奖励越高。
-
-默认权重：
-
-```python
-env = RequesterCrowdEnv(
-    train_data,
-    quality_weight=1.0,
-    diversity_weight=0.3,
-    urgency_weight=0.5,
-)
-```
-
-可以按需调整权重，例如更强调多样性：
-
-```python
-env = RequesterCrowdEnv(train_data, diversity_weight=0.8)
-```
-
-## 参与者/请求者同学如何接入自己的设计
-
-参与者和请求者同学设计完自己的”状态、行为、奖励”以后，不一定要重新写一套环境。建议按改动大小分三种情况处理。
-
-### 情况一：只改奖励权重
-
-**Worker 视角**：如果状态仍然使用 `state[“features”]`，动作仍然是”从候选 project 中选一个”，只是奖励公式里的权重不同，那么不需要写新的代码文件，也不需要改 `crowd_env.py`。
-
-```python
-from env import CrowdRecEnv, load_split
-
-train_data = load_split(“train”)
-
-env = CrowdRecEnv(
-    train_data,
-    reward_type=”requester”,
-    requester_quality_weight=1.0,
-    requester_popularity_weight=0.2,
-)
-```
-
-参与者方向通常可以直接用：
-
-```python
-env = CrowdRecEnv(train_data, reward_type=”worker”)
-```
-
-如果想做平台综合目标：
-
-```python
-env = CrowdRecEnv(train_data, reward_type=”hybrid”, hybrid_alpha=0.6)
-```
-
-这里 `hybrid_alpha=0.6` 表示参与者奖励占 60%，请求者奖励占 40%。
-
-**Requester 视角**：直接调整 `RequesterCrowdEnv` 的权重参数：
-
-```python
-from env import RequesterCrowdEnv, load_requester_split
-
-train_data = load_requester_split(“train”)
-env = RequesterCrowdEnv(train_data, quality_weight=1.0, diversity_weight=0.5, urgency_weight=0.3)
-```
-
-### 情况二：奖励公式变复杂
-
-如果参与者或请求者同学设计了新的奖励公式，例如：
-
-- 参与者：命中真实选择之外，还考虑 `category_match`、`industry_match`。
-- 请求者（worker 视角）：考虑 `worker_quality`、`project_popularity`、项目是否缺回答。
-- 想把负的标准化 `worker_quality` 映射成非负奖励。
-
-这时可以选择两种做法。
-
-第一种做法：直接在 `crowd_env.py` 里加一个新的 `reward_type`。适合公式很短的情况。
-
-需要改 `_compute_reward()`：
-
-```python
-if self.reward_type == "worker_match":
-    return self._worker_match_reward(sample, action)
-```
-
-然后在 `CrowdRecEnv` 类里新增函数：
-
-```python
-def _worker_match_reward(self, sample, action):
-    feat = sample["candidate_features"][action]
-    return 1.0 + 0.2 * feat["category_match"] + 0.2 * feat["industry_match"]
-```
-
-使用时：
-
-```python
-env = CrowdRecEnv(train_data, reward_type="worker_match")
-```
-
-第二种做法：新建一个奖励文件，例如 `env/rewards.py`。适合公式较多、参与者和请求者都要反复实验的情况。
-
-可以新建：
-
-```text
-env/rewards.py
-```
-
-写：
-
-```python
-def worker_interest_reward(sample, action):
-    feat = sample["candidate_features"][action]
-    hit = action == int(sample["positive_index"])
-    if not hit:
-        return 0.0
-    return 1.0 + 0.2 * feat["category_match"] + 0.2 * feat["industry_match"]
-
-
-def requester_quality_reward(sample, action):
-    feat = sample["candidate_features"][action]
-    hit = action == int(sample["positive_index"])
-    if not hit:
-        return 0.0
-    return max(0.0, float(feat["worker_quality"])) + 0.1 * feat["project_popularity"]
-```
-
-然后在 `crowd_env.py` 里导入并接入：
-
-```python
-from .rewards import worker_interest_reward, requester_quality_reward
-```
-
-在 `_compute_reward()` 中增加：
-
-```python
-if self.reward_type == "worker_interest":
-    return worker_interest_reward(sample, action)
-if self.reward_type == "requester_quality":
-    return requester_quality_reward(sample, action)
-```
-
-使用时：
-
-```python
-env = CrowdRecEnv(train_data, reward_type="worker_interest")
-env = CrowdRecEnv(train_data, reward_type="requester_quality")
-```
-
-注意：无论奖励公式怎么改，建议保持"非法 action 由环境统一处理"。也就是说，奖励函数只负责合法 action 的奖励；如果模型选到 padding 位置，`step()` 会直接给 `invalid_action_penalty`。
-    hit = action == int(sample["positive_index"])
-    if not hit:
-        return 0.0
-    return max(0.0, float(feat["worker_quality"])) + 0.1 * feat["project_popularity"]
-```
-
-然后在 `crowd_env.py` 里导入并接入：
-
-```python
-from .rewards import worker_interest_reward, requester_quality_reward
-```
-
-在 `_compute_reward()` 中增加：
-
-```python
-if self.reward_type == "worker_interest":
-    return worker_interest_reward(sample, action)
-if self.reward_type == "requester_quality":
-    return requester_quality_reward(sample, action)
-```
-
-使用时：
-
-```python
-env = CrowdRecEnv(train_data, reward_type="worker_interest")
-env = CrowdRecEnv(train_data, reward_type="requester_quality")
-```
-
-注意：无论奖励公式怎么改，建议保持“非法 action 由环境统一处理”。也就是说，奖励函数只负责合法 action 的奖励；如果模型选到 padding 位置，`step()` 会直接给 `invalid_action_penalty`。
-
-### 情况三：要改状态
-
-如果参与者或请求者同学只是想从现有特征中少用几列或多用几列，优先使用 `feature_order`，不需要写新环境。
-
-**Worker 视角**，参与者模型只使用 worker 质量、历史、活跃天数、类别匹配、行业匹配：
-
-```python
-participant_features = [
-    “worker_quality”,
-    “worker_history_count”,
-    “worker_active_days”,
-    “category_match”,
-    “industry_match”,
-]
-
-env = CrowdRecEnv(
-    train_data,
-    reward_type=”worker”,
-    feature_order=participant_features,
-)
-```
-
-这时：
-
-```text
-state[“features”].shape = [max_candidates, 5]
-```
-
-**Requester 视角**，如果只想用部分特征：
-
-```python
-requester_features = [
-    “worker_quality”,
-    “project_remaining_days”,
-    “project_fill_rate”,
-    “worker_category_match”,
-]
-
-env = RequesterCrowdEnv(
-    train_data,
-    feature_order=requester_features,
-)
-```
-
-只有在下面这些情况下，才需要修改 `crowd_env.py` 的 `_build_state()`：
-
-- 要加入当前样本没有的新特征。
-- 要把多个历史样本拼成序列状态。
-- 要加入 project 剩余时间、当前完成进度等动态状态。
-- 要返回多个输入张量，而不是一个 `features` 矩阵。
-
-如果要改 `_build_state()`，建议仍然保留这两个字段：
-
-```python
-state[“features”]
-state[“action_mask”]
-```
-
-这样模型和测试代码不用大改。
-
-### 情况四：要改动作
-
-当前动作定义是：
-
-- Worker 视角：`action = 推荐第几个候选 project`
-- Requester 视角：`action = 推荐第几个候选 worker`
-
-大多数 DQN 实验都可以沿用这个动作定义，不需要改环境。
-
-如果想把动作改成”推荐多个候选”或者”先选类别再选任务”，那就不是当前这个环境的简单参数修改了，需要改 `step()` 和模型输出：
-
-- `step(action)` 要能接收列表或多阶段动作。
-- `reward` 要根据多个推荐结果计算。
-- `action_mask` 的含义也要重新定义。
-
-建议参与者和请求者同学都保持当前动作定义：**每一步只推荐一个候选**。
-
-## 是否需要写新的代码文件
-
-一般结论：
-
-- 只调奖励权重：不用写新文件。
-- 只换使用哪些特征：不用写新文件，传 `feature_order`。
-- 奖励公式比较短：可以直接在 `crowd_env.py` 里加一个函数和一个 `reward_type`。
-- 奖励公式很多或参与者/请求者各自实验较多：建议新建 `env/rewards.py`。
-- 状态构造大改、动作定义大改：需要改 `crowd_env.py`，必要时可以新建一个继承环境，例如 `participant_env.py` 或 `requester_env.py`。
-
-## Info 字段
-
-### Worker 视角（CrowdRecEnv）
-
-`step()` 返回的 `info` 方便测试同学统计指标：
-
-```python
-{
-    “sample_index”: int,
-    “worker_id”: int,
-    “timestamp”: datetime,
-    “num_candidates”: int,
-    “action”: int,
-    “valid_action”: bool,
-    “chosen_project”: int | None,
-    “positive_project”: int,
-    “positive_index”: int,
-    “hit”: bool,
-    “top_k_hit”: bool,
-    “chosen_popularity_rank”: float | None,
-    “reward”: float,
-    “chosen_features”: dict | None
-}
-```
-
-### Requester 视角（RequesterCrowdEnv）
-
-```python
-{
-    “sample_index”: int,
-    “project_id”: int,
-    “timestamp”: datetime,
-    “num_candidates”: int,
-    “action”: int,
-    “valid_action”: bool,
-    “chosen_worker”: int | None,
-    “positive_worker”: int,
-    “positive_index”: int,
-    “hit”: bool,
-    “top_k_hit”: bool,
-    “chosen_quality_rank”: float | None,
-    “reward”: float,
-    “chosen_features”: dict | None
-}
-```
-
-常用指标（两种视角通用）：
-
-- `hit_rate = mean(info[“hit”])`
-- `avg_reward = mean(info[“reward”])`
-- 非法动作率：`mean(not info[“valid_action”])`
-
-## 跑通测试
-
-**Worker 视角**，在项目根目录运行：
-
-```bash
-python env/demo_random.py --split train --reward-type worker --max-steps 1000
-```
-
-请求者奖励（worker 视角数据）：
-
-```bash
-python env/demo_random.py --split train --reward-type requester --max-steps 1000
-```
-
-**Requester 视角**，用 Python 直接测试：
-
-```python
-from env import RequesterCrowdEnv, load_requester_split
-
-data = load_requester_split(“train”)
-env = RequesterCrowdEnv(data)
-state = env.reset()
-steps, hits = 0, 0
-done = False
-while not done and steps < 1000:
-    action = env.sample_random_action(state)
-    state, reward, done, info = env.step(action)
-    hits += int(info[“hit”])
-    steps += 1
-print(“state_shape:”, env.spec.state_shape)
-print(“action_dim:”, env.spec.action_dim)
-print(“hit_rate:”, hits / steps)
-```
-
-如果能输出 `state_shape`、`action_dim`、`hit_rate`，说明环境可用。
-
-## 使用建议
-
-DQN 模型同学输入 `state[“features”]`，输出长度为 `action_dim` 的 Q 值。选动作前需要把非法位置的 Q 值设成很小：
-
-```python
-q_values[state[“action_mask”] == 0] = -1e9
+# 选动作前屏蔽非法位置
+q_values[state["action_mask"] == 0] = -1e9
 action = q_values.argmax()
+
+# 存 transition
+(state["features"], state["action_mask"], action, reward,
+ next_state["features"] if next_state else None,
+ next_state["action_mask"] if next_state else None,
+ done)
 ```
 
-训练时保存 transition：
+`done=True` 时 `next_state` 为 `None`，需要在存 replay buffer 时做判断。
 
-```python
-(state[“features”], state[“action_mask”], action, reward,
- next_state[“features”], next_state[“action_mask”], done)
-```
-
-如果 `done=True`，`next_state` 会是 `None`。
-
-两种视角的 `state[“features”]` 形状不同（worker 视角 `[20, 13]`，requester 视角 `[20, 16]`），DQN 网络输入层维度需要对应调整。
+Worker 视角输入 `[20, 13]`，Requester 视角输入 `[20, 16]`，两个目标的网络输入层维度不同，不能共用同一个网络。
