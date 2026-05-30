@@ -20,7 +20,12 @@ DEFAULT_DATA_DIR = os.path.join(
     "data_processed",
 )
 
-# 模型输入特征的固定顺序。DQN 看到的是矩阵，必须保证每一列含义稳定。
+REQUESTER_DATA_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)),
+    "data_processed",
+)
+
+# worker 视角特征顺序（13 维）
 DEFAULT_FEATURE_ORDER = [
     "worker_quality",
     "worker_history_count",
@@ -37,12 +42,38 @@ DEFAULT_FEATURE_ORDER = [
     "remaining_days",
 ]
 
+# requester 视角特征顺序（16 维）
+REQUESTER_FEATURE_ORDER = [
+    "project_category",
+    "project_sub_category",
+    "project_industry",
+    "project_duration_days",
+    "project_remaining_days",
+    "project_current_entry_count",
+    "project_hist_entry_count",
+    "project_fill_rate",
+    "worker_quality",
+    "worker_history_count",
+    "worker_active_days",
+    "worker_category_match",
+    "worker_industry_match",
+    "worker_category_count",
+    "worker_already_submitted",
+    "worker_recent_activity",
+]
+
 SPLIT_FILES = {
     "train": "enhanced_train.pkl",
     "val": "enhanced_val.pkl",
     "test": "enhanced_test.pkl",
 }
+REQUESTER_SPLIT_FILES = {
+    "train": "requester_train.pkl",
+    "val": "requester_val.pkl",
+    "test": "requester_test.pkl",
+}
 WORKER_EPISODES_FILE = "worker_episodes.pkl"
+PROJECT_EPISODES_FILE = "project_episodes.pkl"
 
 
 @dataclass(frozen=True)
@@ -208,7 +239,15 @@ class CrowdRecEnv:
         """按固定特征顺序，把每个候选任务的 dict 特征转换成 list。"""
 
         for feat in sample["candidate_features"]:
-            yield [float(feat[name]) for name in self.feature_order]
+            vec = []
+            for name in self.feature_order:
+                v = float(feat[name])
+                # remaining_days 是原始天数（0~200+），其他特征已 z-score 归一化
+                # 用 sigmoid 压到 (0,1) 使量纲一致
+                if name == "remaining_days":
+                    v = 1.0 / (1.0 + np.exp(-v / 30.0))
+                vec.append(v)
+            yield vec
 
     def _build_state(self, sample: Mapping[str, Any]) -> Dict[str, np.ndarray]:
         """把原始样本转换成模型可用的 state 字典。"""
@@ -263,29 +302,27 @@ class CrowdRecEnv:
             "Use 'worker', 'requester', 'requester_urgency', or 'hybrid'."
         )
 
+    @staticmethod
+    def _popularity_score(z: float) -> float:
+        """把 z-score 的 project_popularity 映射到 (0, 1)。"""
+        return 1.0 / (1.0 + np.exp(-z))
+
     def _requester_reward(self, sample: Mapping[str, Any], action: int) -> float:
-        """请求者视角的奖励：希望高质量 worker 完成项目。"""
+        """请求者视角的奖励：希望推荐给流行度高、紧迫度高的项目。"""
 
         feat = sample["candidate_features"][action]
-        # 注意这里的 worker_quality 是预处理后的标准化特征，可能为负。
-        quality = float(feat["worker_quality"])
-        popularity = float(feat.get("project_popularity", 0.0))
-        return (
-            self.requester_quality_weight * quality
-            + self.requester_popularity_weight * popularity
-        )
+        popularity = self._popularity_score(float(feat.get("project_popularity", 0.0)))
+        return self.requester_popularity_weight * popularity if self.requester_popularity_weight > 0 else popularity
 
     def _requester_urgency_reward(self, sample: Mapping[str, Any], action: int) -> float:
-        """请求者紧迫度奖励：高质量 worker 优先推荐给更紧急的项目。"""
+        """请求者紧迫度奖励：优先推荐给更紧急的项目。"""
 
         feat = sample["candidate_features"][action]
-        quality = float(feat["worker_quality"])
-        popularity = float(feat.get("project_popularity", 0.0))
+        popularity = self._popularity_score(float(feat.get("project_popularity", 0.0)))
         urgency = self._compute_urgency(sample, action)
         return (
-            self.requester_quality_weight * quality
+            self.requester_quality_weight * popularity
             + self.requester_urgency_weight * urgency
-            + self.requester_popularity_weight * popularity
         )
 
     def _compute_urgency(self, sample: Mapping[str, Any], action: int) -> float:
@@ -320,7 +357,7 @@ class CrowdRecEnv:
         feat = sample["candidate_features"][index]
         remaining_days = feat.get("remaining_days")
         if remaining_days is not None:
-            return float(remaining_days) > 0
+            return float(remaining_days) >= 0
 
         deadline = self._lookup_candidate_value(project, feat, "deadline")
         if deadline is None:
@@ -378,6 +415,7 @@ class CrowdRecEnv:
         action: int,
         valid_action: bool,
         reward: float,
+        top_k: int = 3,
     ) -> Dict[str, Any]:
         """构造调试和评估用的额外信息。
 
@@ -393,17 +431,196 @@ class CrowdRecEnv:
             sample["candidate_features"][action] if valid_action else None
         )
 
+        # Top-K hit：action 落在 positive_index 附近 K 个位置内视为命中
+        # 这里用"推荐的项目是否是 positive_index"的宽松版本：
+        # 取候选集里 quality_score 最高的 top_k 个，看 positive_index 是否在其中
+        candidate_feats = sample["candidate_features"]
+        n = len(candidate_feats)
+        popularity_scores = [
+            self._popularity_score(float(candidate_feats[i].get("project_popularity", 0.0)))
+            for i in range(n)
+        ]
+        sorted_by_popularity = sorted(range(n), key=lambda i: popularity_scores[i], reverse=True)
+        top_k_indices = sorted_by_popularity[:top_k]
+        top_k_hit = valid_action and (action in top_k_indices)
+
+        # 模型推荐的项目在候选集里的流行度百分位（0=最热门，1=最冷门）
+        if valid_action:
+            rank = sorted_by_popularity.index(action)
+            chosen_popularity_rank = rank / (n - 1) if n > 1 else 0.0
+        else:
+            chosen_popularity_rank = None
+
         return {
             "sample_index": self.index,
             "worker_id": sample["worker_id"],
             "timestamp": sample["timestamp"],
-            "num_candidates": len(sample["candidate_projects"]),
+            "num_candidates": n,
             "action": action,
             "valid_action": valid_action,
             "chosen_project": chosen_project,
             "positive_project": sample["positive_project"],
             "positive_index": positive_index,
             "hit": valid_action and action == positive_index,
+            "top_k_hit": top_k_hit,
+            "chosen_popularity_rank": chosen_popularity_rank,
+            "reward": float(reward),
+            "chosen_features": chosen_features,
+        }
+
+
+def load_requester_split(split: str, data_dir: str = REQUESTER_DATA_DIR) -> List[Dict[str, Any]]:
+    """读取 requester 视角的一个预处理数据划分。
+
+    Args:
+        split: "train"、"val"、"test" 之一；也可以直接传 pkl 文件名。
+        data_dir: 存放 requester_train/val/test.pkl 的目录，默认 data_processed/。
+    """
+    filename = REQUESTER_SPLIT_FILES.get(split, split)
+    path = os.path.join(data_dir, filename)
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
+def load_project_episodes(data_dir: str = REQUESTER_DATA_DIR) -> Dict[int, List[Dict[str, Any]]]:
+    """读取按 project_id 分组的 episode 数据（requester 视角）。"""
+    path = os.path.join(data_dir, PROJECT_EPISODES_FILE)
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
+class RequesterCrowdEnv(CrowdRecEnv):
+    """Requester 视角的众包推荐环境。
+
+    每条样本表示一个 project 收到新 entry 时的决策点：系统从候选 worker 池
+    里推荐最合适的 worker。与 CrowdRecEnv 的区别：
+      - 候选集是 worker（candidate_workers），而非 project
+      - 特征维度 16（project 上下文 + worker 侧特征）
+      - 奖励基于 worker_quality、diversity、urgency
+      - info 返回 project_id、positive_worker 等字段
+    """
+
+    def __init__(
+        self,
+        data: Sequence[Mapping[str, Any]],
+        reward_type: str = "requester",
+        max_candidates: Optional[int] = None,
+        feature_order: Optional[Sequence[str]] = None,
+        invalid_action_penalty: float = -1.0,
+        quality_weight: float = 1.0,
+        diversity_weight: float = 0.3,
+        urgency_weight: float = 0.5,
+        seed: Optional[int] = None,
+    ) -> None:
+        # 用 requester 视角的特征顺序作为默认值
+        feature_order = feature_order or REQUESTER_FEATURE_ORDER
+        super().__init__(
+            data=data,
+            reward_type=reward_type,
+            max_candidates=max_candidates,
+            feature_order=feature_order,
+            invalid_action_penalty=invalid_action_penalty,
+            seed=seed,
+        )
+        self.quality_weight = float(quality_weight)
+        self.diversity_weight = float(diversity_weight)
+        self.urgency_weight = float(urgency_weight)
+
+    @property
+    def _candidate_key(self) -> str:
+        return "candidate_workers"
+
+    def iter_feature_vectors(self, sample: Mapping[str, Any]) -> Iterable[List[float]]:
+        for feat in sample["candidate_features"]:
+            yield [float(feat[name]) for name in self.feature_order]
+
+    def _build_state(self, sample: Mapping[str, Any]) -> Dict[str, np.ndarray]:
+        features = np.zeros(self.spec.state_shape, dtype=np.float32)
+        action_mask = np.zeros(self.max_candidates, dtype=np.float32)
+
+        vectors = list(self.iter_feature_vectors(sample))
+        if len(vectors) > self.max_candidates:
+            raise ValueError(
+                f"Sample has {len(vectors)} candidates, larger than max_candidates={self.max_candidates}."
+            )
+
+        n = len(vectors)
+        features[:n, :] = np.asarray(vectors, dtype=np.float32)
+        for i in range(n):
+            # 用 project_remaining_days 判断任务是否仍在截止期内
+            remaining = sample["candidate_features"][i].get("project_remaining_days")
+            if remaining is None or float(remaining) >= 0:
+                action_mask[i] = 1.0
+
+        return {
+            "features": features,
+            "action_mask": action_mask,
+            "project_id": np.asarray(sample["project_id"], dtype=np.int64),
+            "timestamp_index": np.asarray(self.index, dtype=np.int64),
+        }
+
+    def _compute_reward(self, sample: Mapping[str, Any], action: int) -> float:
+        feat = sample["candidate_features"][action]
+
+        quality = float(feat.get("worker_quality", 0.0))
+        already_submitted = float(feat.get("worker_already_submitted", 0.0))
+        remaining_days = float(sample.get("project_remaining_days", 0.0))
+        urgency = 1.0 / (1.0 + np.exp(remaining_days))
+
+        # 紧急任务时动态放大 quality 权重，而不是单独加一个固定的 urgency 项
+        effective_quality_weight = self.quality_weight * (1.0 + self.urgency_weight * urgency)
+
+        return (
+            effective_quality_weight * quality
+            + self.diversity_weight * (1.0 - already_submitted)
+        )
+
+    def _build_info(
+        self,
+        sample: Mapping[str, Any],
+        action: int,
+        valid_action: bool,
+        reward: float,
+        top_k: int = 3,
+    ) -> Dict[str, Any]:
+        positive_index = int(sample["positive_index"])
+        candidate_feats = sample["candidate_features"]
+        n = len(candidate_feats)
+
+        chosen_worker = (
+            sample["candidate_workers"][action] if valid_action else None
+        )
+        chosen_features = (
+            candidate_feats[action] if valid_action else None
+        )
+
+        # Top-K hit：按 worker_quality 排序，看正样本是否在前 K 名
+        quality_scores = [
+            float(candidate_feats[i].get("worker_quality", 0.0)) for i in range(n)
+        ]
+        sorted_by_quality = sorted(range(n), key=lambda i: quality_scores[i], reverse=True)
+        top_k_indices = sorted_by_quality[:top_k]
+        top_k_hit = valid_action and (action in top_k_indices)
+
+        if valid_action:
+            rank = sorted_by_quality.index(action)
+            chosen_quality_rank = rank / (n - 1) if n > 1 else 0.0
+        else:
+            chosen_quality_rank = None
+
+        return {
+            "sample_index": self.index,
+            "project_id": sample["project_id"],
+            "timestamp": sample["timestamp"],
+            "num_candidates": n,
+            "action": action,
+            "valid_action": valid_action,
+            "chosen_worker": chosen_worker,
+            "positive_worker": sample["positive_worker"],
+            "positive_index": positive_index,
+            "hit": valid_action and action == positive_index,
+            "top_k_hit": top_k_hit,
+            "chosen_quality_rank": chosen_quality_rank,
             "reward": float(reward),
             "chosen_features": chosen_features,
         }
